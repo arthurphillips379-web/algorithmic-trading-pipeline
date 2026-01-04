@@ -1,0 +1,289 @@
+echo "# algorithmic-trading-pipeline" >> README.md
+git init
+git add README.md
+git commit -m "first commit"
+git branch -M main
+git remote add origin https://github.com/arthurphillips379-web/algorithmic-trading-pipeline.git
+git push -u origin main
+
+!pip install -q ta joblib xgboost scikit-learn optuna SQLAlchemy backtesting
+
+import pandas as pd
+import numpy as np
+import ta
+import joblib
+import optuna
+import os
+import warnings
+from xgboost import XGBClassifier
+from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.metrics import precision_score
+from sklearn.model_selection import TimeSeriesSplit
+from google.colab import drive
+from backtesting import Backtest, Strategy
+
+warnings.filterwarnings('ignore')
+
+drive.mount('/content/drive')
+base_path = '/content/drive/MyDrive/ScalpBot_Brain'
+if not os.path.exists(base_path): 
+    os.makedirs(base_path)
+
+FILE_NAME = 'ICMarkets_BTC_5m.csv'
+SPLIT_DATE = '2025-01-01'
+LOOKAHEAD = 12
+TP_MULT = 1.5
+SL_MULT = 1.0
+
+STUDY_NAME = "ICMarkets_5m_HPO_Study"
+STORAGE_PATH = f'{base_path}/{STUDY_NAME}.db'
+STORAGE_URL = f'sqlite:///{STORAGE_PATH}'
+
+print(f"Loading {FILE_NAME}...")
+file_path = f'{base_path}/{FILE_NAME}'
+
+try:
+    df = pd.read_csv(file_path)
+    if len(df.columns) < 2: df = pd.read_csv(file_path, sep='\t')
+except:
+    raise FileNotFoundError(f"Upload {FILE_NAME} to {base_path} first!")
+
+df.columns = [c.replace('<','').replace('>','').lower() for c in df.columns]
+if 'date' in df.columns: df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'])
+else: df['datetime'] = pd.to_datetime(df['time'])
+df.set_index('datetime', inplace=True)
+
+if 'tickvol' in df.columns: df['volume'] = df['tickvol']
+else: df['volume'] = df['vol']
+df = df[['open', 'high', 'low', 'close', 'volume']]
+
+df = df[df.index >= '2023-01-01']
+
+def engineer_features(df):
+    d = df.copy()
+    d['rsi'] = ta.momentum.rsi(d['close'], window=14)
+    d['adx'] = ta.trend.adx(d['high'], d['low'], d['close'], window=14)
+    d['atr'] = ta.volatility.average_true_range(d['high'], d['low'], d['close'], window=14)
+    d['bb_width'] = (ta.volatility.bollinger_hband(d['close']) - ta.volatility.bollinger_lband(d['close'])) / d['close']
+    d['vol_ma'] = d['volume'].rolling(window=50).mean()
+    d['rvol'] = d['volume'] / d['vol_ma']
+    d['rsi_lag1'] = d['rsi'].shift(1)
+    d['rsi_lag2'] = d['rsi'].shift(2)
+    d['rvol_lag1'] = d['rvol'].shift(1)
+    d['volatility'] = d['close'].pct_change().rolling(5).std()
+    d['ema_50'] = ta.trend.ema_indicator(d['close'], window=50)
+    d['dist_ema'] = (d['close'] - d['ema_50']) / d['ema_50']
+    d['log_ret'] = np.log(d['close'] / d['close'].shift(1))
+    d['fast_trend'] = d['ema_50']
+    return d
+
+df_eng = engineer_features(df)
+df_eng.dropna(inplace=True)
+
+def apply_labels(df):
+    labels = []
+    closes = df['close'].values
+    atrs = df['atr'].values
+    for i in range(len(df) - LOOKAHEAD):
+        curr = closes[i]; vol = atrs[i]
+        tp = curr + (vol * TP_MULT); sl = curr - (vol * SL_MULT)
+        future = closes[i+1 : i+LOOKAHEAD+1]
+
+        hit_tp = np.where(future >= tp)[0]; hit_sl = np.where(future <= sl)[0]
+        f_tp = hit_tp[0] if len(hit_tp) > 0 else 999; f_sl = hit_sl[0] if len(hit_sl) > 0 else 999
+
+        if f_tp < f_sl: labels.append(2)
+        elif f_sl < f_tp: labels.append(0)
+        else: labels.append(1)
+
+    labels += [1] * LOOKAHEAD
+    df['label'] = labels
+    return df
+
+df_labeled = apply_labels(df_eng)
+
+print(f"Starting Optuna Optimization (Splitting at {SPLIT_DATE})...")
+
+feature_cols = ['rsi', 'rsi_lag1', 'rsi_lag2', 'adx', 'rvol', 'rvol_lag1',
+                'volatility', 'bb_width', 'dist_ema', 'log_ret']
+
+train_df = df_labeled[df_labeled.index < SPLIT_DATE]
+test_df = df_labeled[df_labeled.index >= SPLIT_DATE]
+
+X_opt = train_df[feature_cols]
+y_opt = train_df['label']
+tscv = TimeSeriesSplit(n_splits=3)
+
+def objective(trial):
+    param = {
+        'n_estimators': trial.suggest_int('n_estimators', 300, 1000),
+        'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.1, log=True),
+        'max_depth': trial.suggest_int('max_depth', 3, 10),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+        'reg_alpha': trial.suggest_float('reg_alpha', 0, 5),
+        'reg_lambda': trial.suggest_float('reg_lambda', 0, 5),
+        'objective': 'multi:softprob', 'num_class': 3, 'eval_metric': 'mlogloss',
+        'random_state': 42, 'n_jobs': -1
+    }
+
+    scores = []
+    for train_index, val_index in tscv.split(X_opt):
+        X_train, X_val = X_opt.iloc[train_index], X_opt.iloc[val_index]
+        y_train, y_val = y_opt.iloc[train_index], y_opt.iloc[val_index]
+
+        weights = compute_sample_weight(class_weight='balanced', y=y_train)
+        model = XGBClassifier(**param)
+        model.fit(X_train, y_train, sample_weight=weights)
+        preds = model.predict(X_val)
+
+        prec = precision_score(y_val, preds, labels=[0, 2], average='weighted', zero_division=0)
+        scores.append(prec)
+
+    return np.mean(scores)
+
+study = optuna.create_study(
+    study_name=STUDY_NAME,
+    storage=STORAGE_URL,
+    direction='maximize',
+    load_if_exists=True
+)
+study.optimize(objective, n_trials=20 - len(study.trials))
+
+print(f"BEST PRECISION SCORE: {study.best_value:.2%}")
+print("BEST PARAMETERS:")
+print(study.best_params)
+
+print("Training FINAL MODEL with Best Params...")
+final_params = study.best_params
+final_params['objective'] = 'multi:softprob'
+final_params['num_class'] = 3
+final_params['eval_metric'] = 'mlogloss'
+final_params['random_state'] = 42
+final_params['n_jobs'] = -1
+
+weights = compute_sample_weight(class_weight='balanced', y=y_opt)
+final_model = XGBClassifier(**final_params)
+final_model.fit(X_opt, y_opt, sample_weight=weights)
+
+joblib.dump(final_model, f'{base_path}/xgb_model.pkl')
+joblib.dump(feature_cols, f'{base_path}/features.pkl')
+
+print("Final Optimized Brain Saved!")
+
+all_X = df_labeled[feature_cols]
+probs = final_model.predict_proba(all_X)
+df_labeled['sell_prob'] = probs[:, 0]
+df_labeled['buy_prob'] = probs[:, 2]
+
+print("Engaging Turbo Mode...")
+
+START_BALANCE = 10000
+COMMISSION = 0.0002
+RELATIVE_SPREAD = 0.0001
+MIN_ATR = 5
+RISK_PER_TRADE = 0.02
+MAX_LEVERAGE = 10
+
+TURBO_CONFIDENCE = 0.45
+TURBO_TP_MULT = 1.5
+TURBO_SL_MULT = 1.5
+TURBO_ADX_MIN = 15.0
+
+class TurboScalper(Strategy):
+    SL_ATR_MULT = TURBO_SL_MULT
+    TP_ATR_MULT = TURBO_TP_MULT
+    MODEL_CONFIDENCE = TURBO_CONFIDENCE
+    RSI_MAX_BUY = 75
+    RSI_MIN_SELL = 25
+
+    cooldown = 0
+
+    def init(self): self.cooldown = 0
+
+    def next(self):
+        self.manage_trades()
+        if self.cooldown > 0:
+            self.cooldown -= 1
+            return
+        if self.position: return
+
+        price = self.data.Close[-1]
+        fast_trend = self.data.fast_trend[-1]
+        atr = self.data.atr[-1]
+        adx = self.data.adx[-1]
+        rsi = self.data.rsi[-1]
+
+        if adx < TURBO_ADX_MIN: return
+        if atr < MIN_ATR: return
+
+        equity = self.equity
+        sl_distance = atr * self.SL_ATR_MULT
+        risk_amt = equity * RISK_PER_TRADE
+        size_by_risk = risk_amt / sl_distance
+        max_size = (equity * MAX_LEVERAGE) / price
+        final_size = int(min(size_by_risk, max_size))
+
+        if final_size < 1: return
+
+        if (price > fast_trend) and (rsi < self.RSI_MAX_BUY):
+            if self.data.buy_prob[-1] > self.MODEL_CONFIDENCE:
+                sl = price - sl_distance
+                tp = price + (atr * self.TP_ATR_MULT)
+                self.buy(size=final_size, sl=sl, tp=tp)
+                self.cooldown = 2
+
+        elif (price < fast_trend) and (rsi > self.RSI_MIN_SELL):
+            if self.data.sell_prob[-1] > self.MODEL_CONFIDENCE:
+                sl = price + sl_distance
+                tp = price - (atr * self.TP_ATR_MULT)
+                self.sell(size=final_size, sl=sl, tp=tp)
+                self.cooldown = 2
+
+    def manage_trades(self):
+        for trade in self.trades:
+            price = self.data.Close[-1]
+            atr = self.data.atr[-1]
+            if trade.is_long:
+                profit_points = price - trade.entry_price
+                if profit_points > (atr * 0.8) and trade.sl < trade.entry_price:
+                    trade.sl = trade.entry_price + (atr * 0.05)
+                if profit_points > (atr * 0.8):
+                    new_sl = price - (atr * 1.0)
+                    if new_sl > trade.sl: trade.sl = new_sl
+            else:
+                profit_points = trade.entry_price - price
+                if profit_points > (atr * 0.8) and trade.sl > trade.entry_price:
+                    trade.sl = trade.entry_price - (atr * 0.05)
+                if profit_points > (atr * 0.8):
+                    new_sl = price + (atr * 1.0)
+                    if new_sl < trade.sl: trade.sl = new_sl
+
+bt_df = df_labeled.copy()
+bt_df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+
+bt_turbo = Backtest(
+    bt_df,
+    TurboScalper,
+    cash=START_BALANCE,
+    commission=COMMISSION,
+    margin=1/MAX_LEVERAGE,
+    trade_on_close=True
+)
+
+stats_turbo = bt_turbo.run()
+
+print("TURBO MODE RESULTS")
+print(f"Start Balance:    {START_BALANCE:.2f}")
+print(f"Final Balance:    {stats_turbo['Equity Final [$]']:.2f}")
+print(f"Total Return:     {stats_turbo['Return [%]']:.2f}%")
+print(f"Total Trades:     {stats_turbo['# Trades']}")
+print(f"Win Rate:         {stats_turbo['Win Rate [%]']:.2f}%")
+print(f"SQN Score:        {stats_turbo['SQN']:.2f}")
+
+if stats_turbo['# Trades'] > 21:
+    print("SUCCESS: Trade frequency increased.")
+else:
+    print("NOTE: Filters still too tight.")
+
+bt_turbo.plot()
