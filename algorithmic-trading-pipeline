@@ -1,11 +1,3 @@
-echo "# algorithmic-trading-pipeline" >> README.md
-git init
-git add README.md
-git commit -m "first commit"
-git branch -M main
-git remote add origin https://github.com/arthurphillips379-web/algorithmic-trading-pipeline.git
-git push -u origin main
-
 !pip install -q ta joblib xgboost scikit-learn optuna SQLAlchemy backtesting
 
 import pandas as pd
